@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>3D Cellular Automata</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <link rel="stylesheet" href="css/main.css">
+</head>
+
+<body>
+    <h1>SPACEBAR</h1>
+
+    <script id="vshader" type="x-shader/x-vertex">
+		precision highp float;
+		uniform mat4 modelViewMatrix;
+		uniform mat4 projectionMatrix;
+        uniform float nParts;
+
+		attribute vec3 position;
+		attribute vec2 uv;
+        attribute vec3 translate;
+        attribute float scale;
+
+		varying vec2 vUv;
+        varying float vScale;
+        varying float distance;
+        
+		void main() {
+
+			vec4 mvPosition = modelViewMatrix * vec4( translate, 1.0 );
+            distance = sqrt(
+                pow(translate.x - nParts / 2.0, 2.0) + 
+                pow(translate.y - nParts / 2.0, 2.0) + 
+                pow(translate.z - nParts / 2.0, 2.0)
+            ) / ( 1.5 * nParts);
+            vScale = scale;
+            mvPosition.xyz += position * scale;
+			vUv = uv;
+			gl_Position = projectionMatrix * mvPosition;
+
+		}
+	</script>
+    <script id="fshader" type="x-shader/x-fragment">
+		precision highp float;
+
+        uniform sampler2D map;
+
+        varying vec2 vUv;
+        varying float vScale;
+        varying float distance;
+
+		void main() {
+            vec4 diffuseColor = texture2D( map, vUv );
+            gl_FragColor = vec4(
+                ( ( 0.01 / distance) * diffuseColor.x + 1.2 * distance * diffuseColor.x ) * vScale, 
+                ( ( 0.01 / distance) * diffuseColor.y + 0.0 * distance * diffuseColor.y ) * vScale, 
+                ( ( 0.1 / distance ) * diffuseColor.z + 0.0 * distance * diffuseColor.z ) * vScale, 
+                diffuseColor.w
+            );
+			if ( diffuseColor.w < 0.5 ) discard;
+		}
+	</script>
+
+    <script type="module">
+        import * as THREE from './three.js/build/three.module.js';
+
+        import Stats from './three.js/jsm/libs/stats.module.js';
+        import { GUI } from './three.js/jsm/libs/dat.gui.module.js';
+
+        import { OrbitControls } from "./three.js/controls/OrbitControls.js";
+
+        let particlesPerAxis = 30;
+        let nParticles = Math.pow(particlesPerAxis, 3);
+
+        let container, stats, populationElement;
+        let alive, dead, decay;
+
+        let camera, scene, renderer;
+        let geometry, material, mesh;
+        let step = false;
+
+        let life;
+        let coordsToIndex = {};
+        let indexToCoords = {};
+
+        let neighboursToLive;
+        let neighboursToBorn;
+        let lifetime;
+
+        const api = {
+            size: 10,
+            rule: "2-6/2-14/4",
+            custom: {
+                'customRule': '',
+                'useCustomRule': false
+            },
+            restart: restart
+        };
+
+        function init() {
+
+            renderer = new THREE.WebGLRenderer();
+            renderer.setClearColor( 0xffffff );
+
+            container = document.createElement('div');
+            document.body.appendChild(container);
+
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            container.appendChild(renderer.domElement);
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 1000);
+            camera.position.set(3.5 * particlesPerAxis, 2 * particlesPerAxis, 1.5 * particlesPerAxis);
+            
+            scene = new THREE.Scene();
+
+            const circleGeometry = new THREE.CircleBufferGeometry(0.8, 16);
+            geometry = new THREE.InstancedBufferGeometry();
+            geometry.index = circleGeometry.index;
+            geometry.attributes = circleGeometry.attributes;
+            
+            material = new THREE.RawShaderMaterial({
+                uniforms: {
+                    "map": { value: new THREE.TextureLoader().load('./three.js/textures/circle.png') },
+                    "nParts": {value: particlesPerAxis}
+                },
+                vertexShader: document.getElementById('vshader').textContent,
+                fragmentShader: document.getElementById('fshader').textContent,
+                depthTest: true,
+                depthWrite: true
+            });
+
+            mesh = new THREE.Mesh(geometry, material);
+            scene.add(mesh);
+
+            initGUI();
+
+            const translateArray = new Float32Array(nParticles * 3);
+            generatePositions(translateArray, particlesPerAxis);
+            geometry.setAttribute('translate', new THREE.InstancedBufferAttribute(translateArray, 3));  
+
+            updateRule();
+            life = new Uint8Array(nParticles);
+
+            const scaleArray = new Float32Array(nParticles);
+            initScale(scaleArray, nParticles, particlesPerAxis, life);
+            geometry.setAttribute('scale', new THREE.InstancedBufferAttribute(scaleArray, 1));
+
+            stats = new Stats();
+            container.appendChild(stats.dom);
+
+            window.addEventListener('resize', onWindowResize, false);
+            document.addEventListener('keydown', onDocumentKeyDown, false);
+
+            const controls = new OrbitControls(camera, renderer.domElement);
+            controls.update();
+
+            return true;
+
+        }
+
+        function initGUI() {
+            const gui = new GUI({ width: 550 });
+            const populationFolder = gui.addFolder( 'Population' );
+
+			populationElement = document.createElement( 'li' );
+			populationElement.classList.add( 'population' );
+
+			populationFolder.__ul.appendChild( populationElement );
+            
+            gui.add( api, 'rule' ).options( 
+                [ 
+                    '6-8/6-8/3', 
+                    '4/4/5',
+                    '0-6/1,3/2',
+                    '2,6,9/4,6,8-9/10',
+                    '9-26/5-7,12-13,15/5',
+                    '4-7/6-8/10',
+                    '0-3,7-9,11-13,18,21-22,24,26/4,13,17,20-24,26/4',
+                    '1,4,8,11,13-26/13-26/5',
+                    '2-6/2-14/4'
+                ] 
+            ).onChange( updateRule );
+            const custom = gui.addFolder( 'custom' );
+            custom.add( api.custom, 'customRule' ).onFinishChange(updateRule);
+            custom.add( api.custom, 'useCustomRule' ).onChange(updateRule);
+            gui.add(api, 'size' ).onFinishChange( v => { 
+                api.size = Math.round(v);
+             });
+            gui.add(api, 'restart');
+
+        }
+
+        function updateRule (value) {
+                let splitRule = api.custom.useCustomRule ? api.custom.customRule.split("/") : api.rule.split("/");
+            
+                let splitNeigboursToLive = splitRule[0].split(",");
+                neighboursToLive = [];
+                splitNeigboursToLive.forEach(neighbourToLive => {
+                    let splitMinMax = neighbourToLive.split("-").map(x=>+x);
+                    if (splitMinMax.length == 1) splitMinMax.push(splitMinMax[0]);
+                    neighboursToLive.push(splitMinMax);
+                });
+
+                let splitNeigboursToBorn = splitRule[1].split(",");
+                neighboursToBorn = [];
+                splitNeigboursToBorn.forEach(neigbourToBorn => {
+                    let splitMinMax = neigbourToBorn.split("-").map(x=>+x);
+                    if (splitMinMax.length == 1) splitMinMax.push(splitMinMax[0]);
+                    neighboursToBorn.push(splitMinMax);
+                });
+
+                lifetime = parseInt(splitRule[2]);
+            }
+
+        function restart() {
+            initScale(mesh.geometry.attributes.scale.array, nParticles, particlesPerAxis);
+            mesh.geometry.attributes.scale.needsUpdate = true;
+        }
+
+        function generatePositions(translateArray, particlesPerAxis) {
+            let counter = 0, index = 0;
+            for (let i = 0; i < particlesPerAxis; i++) {
+                for (let j = 0; j < particlesPerAxis; j++) {
+                    for (let k = 0; k < particlesPerAxis; k++) {
+                        translateArray[counter + 0] = i;
+                        translateArray[counter + 1] = j;
+                        translateArray[counter + 2] = k;
+                        
+                        coordsToIndex[[i,j,k]] = index;
+                        indexToCoords[index] = [i, j, k];
+
+                        counter += 3;
+                        index += 1;
+                    }
+                }
+            }
+        }
+
+        function initScale(scaleArray, nParticles, particlesPerAxis) {
+            for (let i = 0; i < nParticles; i++) {
+                scaleArray[i] = 0.0;
+                life[i] = 0;
+            }
+            alive = decay = dead = 0;
+            for (let i = Math.round(particlesPerAxis/2 - api.size); i < Math.round(particlesPerAxis/2 + api.size); i++) {
+                for (let j = Math.round(particlesPerAxis/2 - api.size); j < Math.round(particlesPerAxis/2 + api.size); j++) {
+                    for (let k = Math.round(particlesPerAxis/2 - api.size); k < Math.round(particlesPerAxis/2 + api.size); k++) {
+                        if (Math.random() < 0.8) continue;
+                        scaleArray[coordsToIndex[[i, j, k]]] = 1.0;
+                        life[coordsToIndex[[i, j, k]]] = lifetime;
+                        ++alive;
+                    }
+                }
+            }
+            dead = nParticles - alive;
+            updatePopulationElement();
+        }
+
+        function updateLives(scaleArray, nParticles, particlesPerAxis) {
+            const tmpLife = Array.from(life);
+            alive = decay = dead = 0;
+
+            for (let i = 0; i < nParticles; i++) {
+                let nNeighbours = sumNeighbours(i, tmpLife);
+                if (life[i] == lifetime) {
+                    let live = false;
+                    neighboursToLive.some(neighbourToLive => {
+                        if (nNeighbours >= neighbourToLive[0] && nNeighbours <= neighbourToLive[1]) {
+                            live = true;
+                            return live;
+                        }
+                    });
+                    if (!live) {
+                        life[i] -= 1;
+                        scaleArray[i] -= (1.0 / lifetime);
+                        ++decay;
+                    } else {
+                        ++alive;
+                    }
+                } else if (life[i] == 0) {
+                    scaleArray[i] = 0.0;
+                    let born = false;
+                    neighboursToBorn.some(neighbourToBorn => {
+                        if (nNeighbours >= neighbourToBorn[0] && nNeighbours <= neighbourToBorn[1]) {
+                            born = true;
+                            return born;
+                        }
+                    });
+                    if (born) {
+                        life[i] = lifetime;
+                        scaleArray[i] = 1.0;
+                        ++alive;
+                    } else {
+                        ++dead;
+                    }
+                } else {
+                    life[i] -= 1;
+                    scaleArray[i] -= (1.0 / lifetime);
+                    ++decay;
+                }
+            }
+            updatePopulationElement();
+        }
+        
+        function updatePopulationElement() {
+            populationElement.innerHTML = [
+                '<i>particlesCount</i>: ' + nParticles,
+                '<i>particlesPerAxis</i>: ' + particlesPerAxis,
+                '<i>alive</i>: ' + alive,
+                '<i>decay</i>: ' + decay,
+                '<i>dead</i>: ' + dead,
+			].join( '<br/>' );
+        }
+
+        function sumNeighbours(index, tmpLife) {
+            let nNeighbours = 0;
+            const coords = indexToCoords[index];
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1]-1, coords[2]  ]]] == lifetime ? 1 : 0;
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1]-1, coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1],   coords[2]  ]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1],   coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1],   coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1]-1, coords[2]  ]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1]-1, coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1],   coords[2]+1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1]+1, coords[2]  ]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1]+1, coords[2]+1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1],   coords[2]  ]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1],   coords[2]+1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1]+1, coords[2]  ]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1]+1, coords[2]+1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1],   coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1]-1, coords[2]  ]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1]-1, coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1],   coords[2]+1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1]+1, coords[2]  ]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1]+1, coords[2]+1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1]+1, coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0],   coords[1]-1, coords[2]+1]]] == lifetime ? 1 : 0;
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1]+1, coords[2]-1]]] == lifetime ? 1 : 0; 
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]+1, coords[1]-1, coords[2]+1]]] == lifetime ? 1 : 0;  
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1]+1, coords[2]-1]]] == lifetime ? 1 : 0;
+            nNeighbours += tmpLife[coordsToIndex[[coords[0]-1, coords[1]-1, coords[2]+1]]] == lifetime ? 1 : 0;
+            return nNeighbours;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onDocumentKeyDown(event) {
+            var keyCode = event.which;
+            if (keyCode == 32) {
+                step = !step;
+            }
+        }
+
+        function animate(now) {
+            requestAnimationFrame(animate);
+            render();
+            stats.update();
+        }
+
+        function render() {
+            if (mesh && step) {
+                step = !step;
+                let numParticles = Math.round(particlesPerAxis);
+                updateLives(mesh.geometry.attributes.scale.array, Math.pow(numParticles, 3), numParticles);
+                mesh.geometry.attributes.scale.needsUpdate = true
+            }
+            renderer.render(scene, camera);
+        }
+
+        if (init()) {
+            animate();
+        }
+    </script>
+
+</body>
+
+</html>

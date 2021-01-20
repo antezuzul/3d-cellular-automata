@@ -1,0 +1,26 @@
+body {
+    margin: 0;
+    height: 100vh;
+}
+
+canvas {
+    display: block;
+}
+
+.dg .folder .population {
+    height: auto;
+}
+
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@600&display=swap');
+
+h1 {
+    position: absolute;
+    left: 2em;
+    bottom: 2em;
+    font-family: 'Montserrat', sans-serif;
+    text-transform: uppercase;
+    width: auto;
+    line-height: .8em;
+    border: 5px solid black;
+    padding: .2em;
+}
