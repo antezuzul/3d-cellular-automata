@@ -1,1 +1,6 @@
 .vscode
+/.metadata/
+.classpath
+.gitignore
+.project
+.settings
